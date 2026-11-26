@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
     inputs:
+      deploy_existing_tag:
+        description: "Optional: Deploy an existing GAR image tag directly (e.g., v1 or latest)"
+        required: false
+        default: ""
       rollback_revision:
         description: "Optional: Helm revision number to roll back to (leave empty for normal deploy)"
         required: false
@@ -32,13 +36,13 @@ jobs:
         run: npm test
 
   build-and-push:
-    name: Build & Push Image to Registry
+    name: Build & Push Image to GAR
     needs: test
-    if: ${{ github.event.inputs.rollback_revision == '' }}
+    if: ${{ github.event.inputs.rollback_revision == '' && github.event.inputs.deploy_existing_tag == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      id-token: write
 
     outputs:
       image_tag: ${{ steps.meta.outputs.sha_tag }}
@@ -52,16 +56,26 @@ jobs:
         id: meta
         run: |
           SHA_TAG="${GITHUB_SHA::12}"
-          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REGISTRY="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}"
           echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
-          echo "full_image=ghcr.io/${OWNER}/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
+          echo "full_image=${REGISTRY}/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
 
-      - name: Login to Container Registry
+      - name: Authenticate to Google Cloud via Direct WIF
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+
+      - name: Mint STS Access Token for Docker
+        id: gcp-token
+        run: echo "token=$(gcloud auth print-access-token)" >> $GITHUB_OUTPUT
+
+      - name: Login to Google Artifact Registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ vars.GCP_REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.gcp-token.outputs.token }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -80,7 +94,7 @@ jobs:
   deploy:
     name: Deploy to GKE Cluster
     needs: [test, build-and-push]
-    if: ${{ always() && needs.test.result == 'success' && (needs.build-and-push.result == 'success' || github.event.inputs.rollback_revision != '') }}
+    if: ${{ always() && needs.test.result == 'success' && (needs.build-and-push.result == 'success' || github.event.inputs.rollback_revision != '' || github.event.inputs.deploy_existing_tag != '') }}
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -90,6 +104,17 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Resolve Target Image & Tag
+        id: target
+        run: |
+          REGISTRY="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}"
+          echo "full_image=${REGISTRY}/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
+          if [ -n "${{ github.event.inputs.deploy_existing_tag }}" ]; then
+            echo "image_tag=${{ github.event.inputs.deploy_existing_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "image_tag=${{ needs.build-and-push.outputs.image_tag }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Authenticate to Google Cloud via Direct WIF
         uses: google-github-actions/auth@v2
@@ -128,13 +153,13 @@ jobs:
             --wait \
             --timeout 2m
 
-      - name: Deploy Application via Helm (Atomic)
+      - name: Deploy Application via Helm (Rollback-on-Failure)
         if: ${{ github.event.inputs.rollback_revision == '' }}
         run: |
           helm upgrade --install ${{ env.HELM_RELEASE }} ./helm/my-app \
             --namespace ${{ vars.K8S_NAMESPACE }} \
-            --set image.repository="${{ needs.build-and-push.outputs.full_image }}" \
-            --set image.tag="${{ needs.build-and-push.outputs.image_tag }}" \
+            --set image.repository="${{ steps.target.outputs.full_image }}" \
+            --set image.tag="${{ steps.target.outputs.image_tag }}" \
             --set env.DEPLOYED_COMMIT="${{ github.sha }}" \
             --rollback-on-failure \
             --cleanup-on-fail \
@@ -145,7 +170,7 @@ jobs:
         run: |
           kubectl rollout status deployment/${{ env.HELM_RELEASE }} \
             --namespace=${{ vars.K8S_NAMESPACE }} \
-            --timeout=180s
+            --timeout=120s
           kubectl get pods -l app=${{ env.HELM_RELEASE }} -n ${{ vars.K8S_NAMESPACE }}
 
       - name: Run Smoke Health Check Against Service Endpoint
