@@ -126,7 +126,7 @@ jobs:
           helm rollback ${{ env.HELM_RELEASE }} ${{ github.event.inputs.rollback_revision }} \
             --namespace ${{ vars.K8S_NAMESPACE }} \
             --wait \
-            --timeout 5m
+            --timeout 2m
 
       - name: Deploy Application via Helm (Atomic)
         if: ${{ github.event.inputs.rollback_revision == '' }}
@@ -136,10 +136,10 @@ jobs:
             --set image.repository="${{ needs.build-and-push.outputs.full_image }}" \
             --set image.tag="${{ needs.build-and-push.outputs.image_tag }}" \
             --set env.DEPLOYED_COMMIT="${{ github.sha }}" \
-            --atomic \
+            --rollback-on-failure \
             --cleanup-on-fail \
             --wait \
-            --timeout 5m
+            --timeout 2m
 
       - name: Validate Rollout & Pod Readiness
         run: |
