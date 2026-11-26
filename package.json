@@ -1,0 +1,13 @@
+{
+  "name": "gke-ci-cd-demo",
+  "version": "1.0.0",
+  "description": "GKE CI/CD Pipeline Demo Service",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/server.test.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

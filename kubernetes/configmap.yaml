@@ -1,0 +1,11 @@
+
+apiVersion: v1
+kind: ConfigMap
+
+metadata:
+  name: gke-ci-cd-config
+  namespace: github-actions-demo
+
+data:
+  NODE_ENV: "production"
+  PORT: "3000"

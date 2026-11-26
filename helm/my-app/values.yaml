@@ -1,0 +1,30 @@
+replicaCount: 2
+
+image:
+  repository: asia-south1-docker.pkg.dev/internal-sandbox-446612/interns-poc-repo/my-app
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: LoadBalancer
+  port: 80
+  targetPort: 8080
+
+env:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+
+secrets:
+  dbPassword: ""
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "250m"
+    memory: "256Mi"
+
+probes:
+  livenessPath: /healthz
+  readinessPath: /readyz

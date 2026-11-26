@@ -1,0 +1,55 @@
+
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: gke-ci-cd-app
+  namespace: github-actions-demo
+
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+
+  selector:
+    matchLabels:
+      app: gke-ci-cd-app
+
+  template:
+    metadata:
+      labels:
+        app: gke-ci-cd-app
+
+    spec:
+      containers:
+        - name: gke-ci-cd-app
+
+          image: IMAGE_PLACEHOLDER
+
+          ports:
+            - containerPort: 3000
+
+          envFrom:
+            - configMapRef:
+                name: gke-ci-cd-config
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 20

@@ -1,0 +1,158 @@
+name: Build, Push & Deploy to GKE
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      rollback_revision:
+        description: "Optional: Helm revision number to roll back to (leave empty for normal deploy)"
+        required: false
+        default: ""
+
+env:
+  IMAGE_NAME: my-app
+  HELM_RELEASE: my-app
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run Tests
+        run: npm test
+
+  build-and-push:
+    name: Build & Push Image to GAR
+    needs: test
+    if: ${{ github.event.inputs.rollback_revision == '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.sha_tag }}
+      full_image: ${{ steps.meta.outputs.full_image }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Generate Image Metadata
+        id: meta
+        run: |
+          SHA_TAG="${GITHUB_SHA::12}"
+          REGISTRY="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}"
+          echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image=${REGISTRY}/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.full_image }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ steps.meta.outputs.full_image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to GKE Cluster
+    needs: [test, build-and-push]
+    if: ${{ always() && needs.test.result == 'success' && (needs.build-and-push.result == 'success' || github.event.inputs.rollback_revision != '') }}
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE Cluster Credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+          location: ${{ vars.GKE_LOCATION }}
+
+      - name: Ensure Target Namespace & Secret Exist
+        run: |
+          kubectl create namespace ${{ vars.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic ${{ env.HELM_RELEASE }}-secrets \
+            --namespace=${{ vars.K8S_NAMESPACE }} \
+            --from-literal=db-password="${{ secrets.APP_DB_PASSWORD }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Execute Manual Helm Rollback
+        if: ${{ github.event.inputs.rollback_revision != '' }}
+        run: |
+          helm rollback ${{ env.HELM_RELEASE }} ${{ github.event.inputs.rollback_revision }} \
+            --namespace ${{ vars.K8S_NAMESPACE }} \
+            --wait \
+            --timeout 5m
+
+      - name: Deploy Application via Helm (Atomic)
+        if: ${{ github.event.inputs.rollback_revision == '' }}
+        run: |
+          helm upgrade --install ${{ env.HELM_RELEASE }} ./helm/my-app \
+            --namespace ${{ vars.K8S_NAMESPACE }} \
+            --set image.repository="${{ needs.build-and-push.outputs.full_image }}" \
+            --set image.tag="${{ needs.build-and-push.outputs.image_tag }}" \
+            --set env.DEPLOYED_COMMIT="${{ github.sha }}" \
+            --atomic \
+            --cleanup-on-fail \
+            --wait \
+            --timeout 5m
+
+      - name: Validate Rollout & Pod Readiness
+        run: |
+          kubectl rollout status deployment/${{ env.HELM_RELEASE }} \
+            --namespace=${{ vars.K8S_NAMESPACE }} \
+            --timeout=180s
+          kubectl get pods -l app=${{ env.HELM_RELEASE }} -n ${{ vars.K8S_NAMESPACE }}
+
+      - name: Run Smoke Health Check Against Service Endpoint
+        run: |
+          kubectl port-forward svc/${{ env.HELM_RELEASE }} 8080:80 -n ${{ vars.K8S_NAMESPACE }} &
+          PF_PID=$!
+          sleep 3
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/readyz || true)
+          kill $PF_PID || true
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "ERROR: Smoke test failed with HTTP status $HTTP_STATUS. Triggering emergency rollback..."
+            helm rollback ${{ env.HELM_RELEASE }} 0 --namespace ${{ vars.K8S_NAMESPACE }} --wait
+            exit 1
+          fi
+          echo "Smoke test passed! Endpoint returned HTTP 200."
