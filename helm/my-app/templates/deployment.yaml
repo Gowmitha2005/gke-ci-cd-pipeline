@@ -4,6 +4,7 @@ metadata:
   name: {{ .Release.Name }}
   labels:
     app: {{ .Release.Name }}
+    environment: {{ .Release.Namespace }}
 spec:
   replicas: {{ .Values.replicaCount }}
   revisionHistoryLimit: 5
@@ -19,15 +20,17 @@ spec:
     metadata:
       labels:
         app: {{ .Release.Name }}
+        environment: {{ .Release.Namespace }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
-      imagePullSecrets:
-        - name: ghcr-pull-secret
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
           ports:
             - name: http
               containerPort: {{ .Values.service.targetPort }}
