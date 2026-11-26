@@ -56,12 +56,12 @@ jobs:
           echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
           echo "full_image=${REGISTRY}/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
 
-      - name: Authenticate to Google Cloud via WIF
+      - name: Authenticate to Google Cloud via Direct WIF
         id: auth
         uses: google-github-actions/auth@v2
         with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           token_format: access_token
 
       - name: Login to Google Artifact Registry
@@ -99,17 +99,27 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud via WIF
+      - name: Authenticate to Google Cloud via Direct WIF
+        id: auth
         uses: google-github-actions/auth@v2
         with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
 
-      - name: Get GKE Cluster Credentials
-        uses: google-github-actions/get-gke-credentials@v2
-        with:
-          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
-          location: ${{ vars.GKE_LOCATION }}
+      - name: Configure Kubeconfig Directly via Endpoint & WIF Token
+        run: |
+          echo "${{ secrets.GKE_CLUSTER_CA_DATA }}" | base64 -d > /tmp/gke-ca.crt
+          kubectl config set-cluster gke-cluster \
+            --server="https://${{ vars.GKE_CLUSTER_ENDPOINT }}" \
+            --certificate-authority=/tmp/gke-ca.crt \
+            --embed-certs=true
+          kubectl config set-credentials github-wif-user \
+            --token="${{ steps.auth.outputs.access_token }}"
+          kubectl config set-context gke-context \
+            --cluster=gke-cluster \
+            --user=github-wif-user
+          kubectl config use-context gke-context
 
       - name: Ensure Target Namespace & Secret Exist
         run: |
