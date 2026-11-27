@@ -1,181 +1,154 @@
-name: Build, Push & Deploy to GKE
+name: GitHub Actions CI-CD to GKE
 
 on:
   push:
     branches:
       - main
+
+  pull_request:
+    branches:
+      - main
+
   workflow_dispatch:
     inputs:
       deploy_existing_tag:
-        description: "Optional: Deploy an existing GAR image tag directly (e.g., v1 or latest)"
-        required: false
-        default: ""
-      rollback_revision:
-        description: "Optional: Helm revision number to roll back to (leave empty for normal deploy)"
+        description: "Optional: Existing GAR image tag to deploy (e.g., v1 or latest)"
         required: false
         default: ""
 
 env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+  GKE_CLUSTER_ENDPOINT: ${{ vars.GKE_CLUSTER_ENDPOINT }}
   IMAGE_NAME: my-app
   HELM_RELEASE: my-app
+  NAMESPACE: ${{ vars.K8S_NAMESPACE }}
 
 jobs:
-  test:
-    name: Run Unit Tests
+
+  build-and-deploy:
+
+    name: Build and Deploy
     runs-on: ubuntu-latest
+
+    # Do not deploy from pull requests.
+    if: github.event_name != 'pull_request'
+
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
-      - name: Checkout Repository
+
+      # 1. Checkout source code
+      - name: Checkout source code
         uses: actions/checkout@v4
 
+      # 2. Set up Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: '22'
 
-      - name: Run Tests
+      # 3. Run application tests
+      - name: Run tests
         run: npm test
 
-  build-and-push:
-    name: Build & Push Image to GAR
-    needs: test
-    if: ${{ github.event.inputs.rollback_revision == '' && github.event.inputs.deploy_existing_tag == '' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    outputs:
-      image_tag: ${{ steps.meta.outputs.sha_tag }}
-      full_image: ${{ steps.meta.outputs.full_image }}
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Generate Image Metadata
+      # 4. Resolve image tag (pre-built tag or 12-char commit SHA)
+      - name: Resolve image metadata
         id: meta
         run: |
-          SHA_TAG="${GITHUB_SHA::12}"
-          REGISTRY="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}"
-          echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
-          echo "full_image=${REGISTRY}/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
-
-      - name: Authenticate to Google Cloud via Direct WIF
-        uses: google-github-actions/auth@v2
-        with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-
-      - name: Mint STS Access Token for Docker
-        id: gcp-token
-        run: echo "token=$(gcloud auth print-access-token)" >> $GITHUB_OUTPUT
-
-      - name: Login to Google Artifact Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ vars.GCP_REGION }}-docker.pkg.dev
-          username: oauth2accesstoken
-          password: ${{ steps.gcp-token.outputs.token }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ steps.meta.outputs.full_image }}:${{ steps.meta.outputs.sha_tag }}
-            ${{ steps.meta.outputs.full_image }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  deploy:
-    name: Deploy to GKE Cluster
-    needs: [test, build-and-push]
-    if: ${{ always() && needs.test.result == 'success' && (needs.build-and-push.result == 'success' || github.event.inputs.rollback_revision != '' || github.event.inputs.deploy_existing_tag != '') }}
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Resolve Target Image & Tag
-        id: target
-        run: |
-          REGISTRY="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}"
-          echo "full_image=${REGISTRY}/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
           if [ -n "${{ github.event.inputs.deploy_existing_tag }}" ]; then
-            echo "image_tag=${{ github.event.inputs.deploy_existing_tag }}" >> $GITHUB_OUTPUT
+            echo "tag=${{ github.event.inputs.deploy_existing_tag }}" >> $GITHUB_OUTPUT
           else
-            echo "image_tag=${{ needs.build-and-push.outputs.image_tag }}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_SHA::12}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Authenticate to Google Cloud via Direct WIF
+      # 5. Authenticate with Google Cloud using Direct WIF
+      - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v2
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
+          project_id: ${{ env.PROJECT_ID }}
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
 
-      - name: Configure Kubeconfig Directly via Endpoint & WIF Token
+      # 6. Configure Docker authentication for GAR
+      - name: Configure Docker
+        if: ${{ github.event.inputs.deploy_existing_tag == '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      # 7. Build and push Docker image to Artifact Registry
+      - name: Build and push Docker image
+        if: ${{ github.event.inputs.deploy_existing_tag == '' }}
         run: |
-          ACCESS_TOKEN=$(gcloud auth print-access-token)
-          echo "${{ secrets.GKE_CLUSTER_CA_DATA }}" | base64 -d > /tmp/gke-ca.crt
-          kubectl config set-cluster gke-cluster \
-            --server="https://${{ vars.GKE_CLUSTER_ENDPOINT }}" \
-            --certificate-authority=/tmp/gke-ca.crt \
+          IMAGE_URI="$REGION-docker.pkg.dev/$PROJECT_ID/$GAR_REPOSITORY/$IMAGE_NAME"
+
+          docker build \
+            -t "$IMAGE_URI:${{ steps.meta.outputs.tag }}" \
+            -t "$IMAGE_URI:latest" .
+
+          docker push "$IMAGE_URI" --all-tags
+
+      # 8. Configure GKE cluster credentials via endpoint & WIF token
+      - name: Get GKE credentials
+        env:
+          KUBECONFIG: /tmp/kubeconfig
+        run: |
+          echo "${{ secrets.GKE_CLUSTER_CA_DATA }}" | base64 -d > /tmp/ca.crt
+
+          kubectl config set-cluster gowmitha-ingress \
+            --server="https://$GKE_CLUSTER_ENDPOINT" \
+            --certificate-authority=/tmp/ca.crt \
             --embed-certs=true
+
           kubectl config set-credentials github-wif-user \
-            --token="${ACCESS_TOKEN}"
+            --token="${{ steps.auth.outputs.access_token }}"
+
           kubectl config set-context gke-context \
-            --cluster=gke-cluster \
+            --cluster=gowmitha-ingress \
             --user=github-wif-user
+
           kubectl config use-context gke-context
 
-      - name: Ensure Target Namespace & Secret Exist
+      # 9. Deploy application to GKE using Helm
+      - name: Deploy to GKE
+        id: deploy
+        env:
+          KUBECONFIG: /tmp/kubeconfig
         run: |
-          kubectl create namespace ${{ vars.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create secret generic ${{ env.HELM_RELEASE }}-secrets \
-            --namespace=${{ vars.K8S_NAMESPACE }} \
-            --from-literal=db-password="${{ secrets.APP_DB_PASSWORD }}" \
-            --dry-run=client -o yaml | kubectl apply -f -
+          IMAGE_URI="$REGION-docker.pkg.dev/$PROJECT_ID/$GAR_REPOSITORY/$IMAGE_NAME"
 
-      - name: Execute Manual Helm Rollback
-        if: ${{ github.event.inputs.rollback_revision != '' }}
-        run: |
-          helm rollback ${{ env.HELM_RELEASE }} ${{ github.event.inputs.rollback_revision }} \
-            --namespace ${{ vars.K8S_NAMESPACE }} \
-            --wait \
-            --timeout 2m
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Deploy Application via Helm (Rollback-on-Failure)
-        if: ${{ github.event.inputs.rollback_revision == '' }}
-        run: |
-          helm upgrade --install ${{ env.HELM_RELEASE }} ./helm/my-app \
-            --namespace ${{ vars.K8S_NAMESPACE }} \
-            --set image.repository="${{ steps.target.outputs.full_image }}" \
-            --set image.tag="${{ steps.target.outputs.image_tag }}" \
-            --set env.DEPLOYED_COMMIT="${{ github.sha }}" \
+          helm upgrade --install "$HELM_RELEASE" ./helm/my-app \
+            --namespace "$NAMESPACE" \
+            --set image.repository="$IMAGE_URI" \
+            --set image.tag="${{ steps.meta.outputs.tag }}" \
+            --set env.DEPLOYED_COMMIT="$GITHUB_SHA" \
+            --set secrets.dbPassword="${{ secrets.APP_DB_PASSWORD }}" \
             --rollback-on-failure \
             --cleanup-on-fail \
             --wait \
             --timeout 2m
 
-      - name: Validate Rollout & Pod Readiness
+      # 10. Validate deployment, health endpoint, and rollback on failure
+      - name: Validate deployment and health check
+        id: validation
+        env:
+          KUBECONFIG: /tmp/kubeconfig
         run: |
-          kubectl rollout status deployment/${{ env.HELM_RELEASE }} \
-            --namespace=${{ vars.K8S_NAMESPACE }} \
-            --timeout=120s
-          kubectl get pods -l app=${{ env.HELM_RELEASE }} -n ${{ vars.K8S_NAMESPACE }}
+          if ! kubectl rollout status deployment/$HELM_RELEASE -n "$NAMESPACE" --timeout=120s; then
+            echo "Deployment rollout failed. Triggering Helm rollback..."
+            helm rollback "$HELM_RELEASE" 0 -n "$NAMESPACE" --wait || true
+            exit 1
+          fi
 
-      - name: Run Smoke Health Check Against Service Endpoint
-        run: |
-          kubectl port-forward svc/${{ env.HELM_RELEASE }} 8080:80 -n ${{ vars.K8S_NAMESPACE }} &
+          kubectl port-forward svc/$HELM_RELEASE 8080:80 -n "$NAMESPACE" &
           PF_PID=$!
           sleep 3
 
@@ -183,8 +156,30 @@ jobs:
           kill $PF_PID || true
 
           if [ "$HTTP_STATUS" != "200" ]; then
-            echo "ERROR: Smoke test failed with HTTP status $HTTP_STATUS. Triggering emergency rollback..."
-            helm rollback ${{ env.HELM_RELEASE }} 0 --namespace ${{ vars.K8S_NAMESPACE }} --wait
+            echo "Smoke test failed (HTTP $HTTP_STATUS). Triggering Helm rollback..."
+            helm rollback "$HELM_RELEASE" 0 -n "$NAMESPACE" --wait || true
             exit 1
           fi
-          echo "Smoke test passed! Endpoint returned HTTP 200."
+
+          echo "Deployment and /readyz health check passed (HTTP 200)."
+
+      # 11. Verify running pods and services
+      - name: Verify GKE resources
+        if: success()
+        env:
+          KUBECONFIG: /tmp/kubeconfig
+        run: |
+          kubectl get deployments -n "$NAMESPACE"
+          kubectl get pods -n "$NAMESPACE"
+          kubectl get services -n "$NAMESPACE"
+          helm list -n "$NAMESPACE"
+
+      # 12. Display deployment information
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "Application deployed successfully!"
+          echo "Project: $PROJECT_ID"
+          echo "Cluster: gowmitha-ingress ($GKE_CLUSTER_ENDPOINT)"
+          echo "Image: $REGION-docker.pkg.dev/$PROJECT_ID/$GAR_REPOSITORY/$IMAGE_NAME:${{ steps.meta.outputs.tag }}"
+          echo "Namespace: $NAMESPACE"
